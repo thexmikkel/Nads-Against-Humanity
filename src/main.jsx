@@ -36,7 +36,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
         appId={appId}
         config={{
           // Only Monad Games ID as a login option
-          loginMethodsAndOrder: { primary: ['privy:XX-MONADGAMESID-KEY-XX'] },
+          loginMethodsAndOrder: { primary: ['privy:cmd8euall0037le0my79qpz42'] },
           embeddedWallets: { createOnLogin: 'users-without-wallets' },
 
           // Tell Privy which chain to use
