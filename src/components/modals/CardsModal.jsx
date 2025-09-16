@@ -1,131 +1,126 @@
-import React, { useEffect, useMemo, useState } from 'react'
-import { toast } from '../../lib/toast.jsx'
+// src/components/modals/CardsModal.jsx
+import React, { useEffect, useState } from 'react'
 
-const PAGE = 20
+const PAGE = 24
 
 export default function CardsModal({ getCards }) {
   const [tab, setTab] = useState('prompts') // 'prompts' | 'answers'
-  const [count, setCount] = useState(0)
+  const [rows, setRows] = useState([])      // string[] (text only)
   const [startId, setStartId] = useState(1)
-  const [rows, setRows] = useState([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
-  const [onlyActive, setOnlyActive] = useState(true)
+  const [err, setErr] = useState('')
 
-  const close = () => document.getElementById('cardsModal').close()
+  const close = () => document.getElementById('cardsModal')?.close()
 
-  useEffect(() => {
-    setStartId(1)
-  }, [tab, onlyActive])
+  async function loadPage(kind = tab, start = startId) {
+    try {
+      setLoading(true)
+      setErr('')
+      const C = await getCards()
+      if (!C) throw new Error('Cards contract not ready')
 
-  useEffect(() => {
-    (async () => {
-      try {
-        setLoading(true)
-        const c = await getCards()
-        if (tab === 'prompts') {
-          const total = await c.promptCount()
-          setCount(Number(total))
-          const page = await c.pagePrompts(startId, PAGE, onlyActive)
-          const out = []
-          for (let i = 0; i < page.ids.length; i++) {
-            out.push({
-              id: Number(page.ids[i]),
-              text: page.texts[i],
-              img: Number(page.imageRefs[i]),
-              active: page.actives[i]
-            })
-          }
-          setRows(out)
-        } else {
-          const total = await c.answerCount()
-          setCount(Number(total))
-          const page = await c.pageAnswers(startId, PAGE, onlyActive)
-          const out = []
-          for (let i = 0; i < page.ids.length; i++) {
-            out.push({
-              id: Number(page.ids[i]),
-              text: page.texts[i],
-              img: Number(page.imageRefs[i]),
-              active: page.actives[i]
-            })
-          }
-          setRows(out)
-        }
-      } catch (e) {
-        console.error(e)
-        toast('Failed to load cards', 'error')
-      } finally {
-        setLoading(false)
+      let count = 0
+      if (kind === 'prompts') {
+        count = Number(await C.promptCount())
+        const res = await C.pagePrompts(start, PAGE, true) // onlyActive = true
+        const texts = Array.from(res[1] || [])
+        const actives = Array.from(res[3] || []).map(Boolean)
+        // keep only active, sort alpha
+        const filtered = texts.filter((_, i) => actives[i]).sort((a, b) =>
+          String(a || '').localeCompare(String(b || ''), undefined, { sensitivity: 'base' })
+        )
+        setRows(filtered)
+      } else {
+        count = Number(await C.answerCount())
+        const res = await C.pageAnswers(start, PAGE, true)
+        const texts = Array.from(res[1] || [])
+        const actives = Array.from(res[3] || []).map(Boolean)
+        const filtered = texts.filter((_, i) => actives[i]).sort((a, b) =>
+          String(a || '').localeCompare(String(b || ''), undefined, { sensitivity: 'base' })
+        )
+        setRows(filtered)
       }
-    })()
-  }, [tab, startId, onlyActive, getCards])
+      setTotal(count)
+    } catch (e) {
+      setRows([])
+      setErr(e?.message || 'Failed to load cards')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // initial + when tab/startId changes
+  useEffect(() => { loadPage(tab, startId) }, [tab, startId])
 
   const canPrev = startId > 1
-  const canNext = rows.length === PAGE && rows[rows.length - 1].id < count
+  const canNext = startId + PAGE <= total
 
   return (
     <dialog id="cardsModal" className="rounded-xl p-0 bg-slate-900 text-slate-100 w-[56rem] max-w-[92vw]">
       <div className="p-5 border-b border-slate-800 text-lg font-semibold">Cards</div>
+
       <div className="p-5 space-y-4">
-        <div className="flex items-center gap-2">
-          <div className="inline-flex rounded-md border border-slate-700 overflow-hidden">
-            <button onClick={() => setTab('prompts')} className={`px-3 py-1.5 text-sm ${tab==='prompts'?'bg-slate-800':'bg-slate-900 hover:bg-slate-800'}`}>Prompts</button>
-            <button onClick={() => setTab('answers')} className={`px-3 py-1.5 text-sm ${tab==='answers'?'bg-slate-800':'bg-slate-900 hover:bg-slate-800'}`}>Answers</button>
-          </div>
-          <label className="ml-3 text-sm inline-flex items-center gap-2">
-            <input type="checkbox" checked={onlyActive} onChange={e => setOnlyActive(e.target.checked)} />
-            Only active
-          </label>
-          <div className="ml-auto text-sm text-slate-400">Total: {count}</div>
+        {/* Tabs */}
+        <div className="inline-flex rounded-md border border-slate-700 overflow-hidden">
+          <button
+            onClick={() => { setTab('prompts'); setStartId(1) }}
+            className={`px-3 py-1.5 text-sm ${tab==='prompts'?'bg-slate-800':'bg-slate-900 hover:bg-slate-800'}`}
+          >
+            Prompts
+          </button>
+          <button
+            onClick={() => { setTab('answers'); setStartId(1) }}
+            className={`px-3 py-1.5 text-sm ${tab==='answers'?'bg-slate-800':'bg-slate-900 hover:bg-slate-800'}`}
+          >
+            Answers
+          </button>
         </div>
 
-        <div className="border border-slate-800 rounded-lg overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-slate-800/40">
-              <tr>
-                <th className="text-left px-3 py-2 w-20">ID</th>
-                <th className="text-left px-3 py-2">Text</th>
-                <th className="text-left px-3 py-2 w-28">ImageRef</th>
-                <th className="text-left px-3 py-2 w-24">Active</th>
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr><td colSpan="4" className="px-3 py-6 text-center text-slate-400">Loading…</td></tr>
-              ) : rows.length ? rows.map(r => (
-                <tr key={`${tab}-${r.id}`} className="border-t border-slate-800/60">
-                  <td className="px-3 py-2 font-mono">{r.id}</td>
-                  <td className="px-3 py-2">{r.text}</td>
-                  <td className="px-3 py-2">{r.img}</td>
-                  <td className="px-3 py-2">{r.active ? 'Yes' : 'No'}</td>
-                </tr>
-              )) : (
-                <tr><td colSpan="4" className="px-3 py-6 text-center text-slate-400">No cards</td></tr>
-              )}
-            </tbody>
-          </table>
+        {/* List */}
+        <div className="rounded-lg border border-slate-800">
+          {loading ? (
+            <div className="p-6 text-center text-slate-400 text-sm">Loading…</div>
+          ) : err ? (
+            <div className="p-6 text-center text-rose-300 text-sm">{err}</div>
+          ) : rows.length ? (
+            <ul className="divide-y divide-slate-800">
+              {rows.map((t, i) => (
+                <li key={`${tab}-${startId}-${i}`} className="p-3 text-sm whitespace-pre-wrap leading-relaxed">
+                  {t || <i className="text-slate-500">(empty)</i>}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="p-6 text-center text-slate-400 text-sm">No cards on this page</div>
+          )}
         </div>
 
+        {/* Pager + Close */}
         <div className="flex items-center justify-between">
-          <button
-            className="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 disabled:opacity-50"
-            onClick={() => setStartId(Math.max(1, startId - PAGE))}
-            disabled={!canPrev}
-          >
-            ← Prev
-          </button>
-          <div className="text-sm text-slate-400">Showing {rows.length} items starting at #{startId}</div>
-          <button
-            className="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 disabled:opacity-50"
-            onClick={() => setStartId(rows.length ? rows[rows.length - 1].id + 1 : startId + PAGE)}
-            disabled={!canNext}
-          >
-            Next →
-          </button>
+          <div className="text-xs text-slate-500">
+            {total ? `Showing ${startId}–${Math.min(startId + PAGE - 1, total)} of ${total}` : ''}
+          </div>
+          <div className="flex gap-2">
+            <button
+              className="px-3 py-1.5 rounded-md bg-slate-800 disabled:opacity-50"
+              onClick={() => canPrev && setStartId(Math.max(1, startId - PAGE))}
+              disabled={!canPrev || loading}
+            >
+              Prev
+            </button>
+            <button
+              className="px-3 py-1.5 rounded-md bg-slate-800 disabled:opacity-50"
+              onClick={() => canNext && setStartId(startId + PAGE)}
+              disabled={!canNext || loading}
+            >
+              Next
+            </button>
+            <button className="px-3 py-1.5 rounded-md bg-slate-700" onClick={close}>
+              Close
+            </button>
+          </div>
         </div>
-      </div>
-      <div className="p-5 border-t border-slate-800 flex justify-end gap-2">
-        <button className="px-3 py-1.5" onClick={close}>Close</button>
       </div>
     </dialog>
   )
