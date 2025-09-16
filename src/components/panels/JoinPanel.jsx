@@ -8,7 +8,7 @@ import { inviteHash } from '../../lib/invite.js'
 const CODE_RE = /^[A-Z0-9]{6}$/
 const MONAD_ID = 10143
 const MONAD_HEX = '0x279f'
-const GID_APP_ID = import.meta.env.VITE_PRIVY_APP_ID
+const GID_APP_ID = import.meta.env.VITE_MONAD_GID_APP_ID || 'cmd8euall0037le0my79qpz42'
 
 function getGamesIdAddressFromPrivyUser(user) {
   try {
@@ -21,9 +21,11 @@ function getGamesIdAddressFromPrivyUser(user) {
 
 export default function JoinPanel({ open, disabled, onClose, onJoined, getGame }) {
   const [code, setCode] = useState('')
-  const [terms, setTerms] = useState(false)
+  const [terms, setTerms] = useState(true)
   const [busy, setBusy] = useState(false)
   const { user } = usePrivy()
+
+  if (!open) return null
 
   async function ensureMonad(provider) {
     const net = await provider.getNetwork()
@@ -31,9 +33,8 @@ export default function JoinPanel({ open, disabled, onClose, onJoined, getGame }
     try {
       await provider.send('wallet_switchEthereumChain', [{ chainId: MONAD_HEX }])
     } catch (err) {
-      const c = err?.code
       const msg = String(err?.message || '')
-      if (c === 4902 || /unknown chain|addEthereumChain|unrecognized/i.test(msg)) {
+      if (err?.code === 4902 || /unknown chain|addEthereumChain|unrecognized/i.test(msg)) {
         await provider.send('wallet_addEthereumChain', [{
           chainId: MONAD_HEX,
           chainName: 'Monad Testnet',
@@ -42,135 +43,111 @@ export default function JoinPanel({ open, disabled, onClose, onJoined, getGame }
           blockExplorerUrls: ['https://testnet.monadexplorer.com/']
         }])
         await provider.send('wallet_switchEthereumChain', [{ chainId: MONAD_HEX }])
-      } else {
-        throw err
-      }
+      } else { throw err }
     }
   }
 
+  async function pasteCode() {
+    try {
+      const txt = await navigator.clipboard.readText()
+      const m = (txt || '').toUpperCase().match(/[A-Z0-9]{6}/)
+      if (m) setCode(m[0])
+    } catch {}
+  }
+
   async function doJoin() {
-    if (disabled) return
+    if (disabled || busy) return
     const codeUpper = (code || '').trim().toUpperCase()
     if (!CODE_RE.test(codeUpper)) return toast('Invalid code format', 'error')
-    if (!terms) return toast('Please accept the game terms to continue', 'error')
+    if (!terms) return toast('Please accept the rules to continue', 'error')
 
     setBusy(true)
     try {
       const game = await getGame()
       const provider = game.runner?.provider || game.provider
-      try {
-        await ensureMonad(provider)
-      } catch (e) {
-        console.warn('ensureMonad failed', e)
-        return toast('Please approve the network switch to Monad Testnet', 'error')
-      }
+      const signer   = game.runner || game.signer
+      await ensureMonad(provider)
 
-      const signer = game.runner
       const addr = await signer.getAddress()
-      const net = await provider.getNetwork()
-      const chainId = Number(net.chainId)
-
-      // 1) Resolve + precheck (never reverts)
       const hash = inviteHash(codeUpper)
+
       const res = await game.canJoinByCode.staticCall(hash, addr)
-      const ok  = Boolean(res?.[0])
-      const gid = Number(res?.[1] || 0n)
+      const ok = Boolean(res?.[0]); const gid = Number(res?.[1] || 0n)
       const reason = (res?.[2] || '').toString()
 
-      if (!ok || gid === 0) {
-        if (reason === 'already joined') {
-          onJoined?.({ code: codeUpper, gameId: String(gid) })
-          localStorage.setItem('activeGame', JSON.stringify({ id: String(gid), code: codeUpper }))
-          toast('You are already in this lobby.', 'success')
-          onClose?.()
-          return
-        }
+      if (!ok && reason !== 'already joined') {
+        setBusy(false)
         return toast(reason || 'Invite not valid or lobby closed.', 'error')
       }
 
-      // 2) Relayer that will finalize
-      const relayer = import.meta.env.VITE_RELAYER_ADDR
-      if (!relayer) return toast('Missing VITE_RELAYER_ADDR', 'error')
-
-      // 3) Sign EIP-712 delegate approval (player -> relayer)
-      const expiresAt = Math.floor(Date.now()/1000) + 24*60*60
-      const domain = { name: 'MonadCAH', version: '1', chainId, verifyingContract: await game.getAddress() }
-      const types = {
-        FinalizeDelegate: [
-          { name: 'player', type: 'address' },
-          { name: 'gameId', type: 'uint256' },
-          { name: 'delegate', type: 'address' },
-          { name: 'expiresAt', type: 'uint256' },
-        ],
-      }
-      const value = { player: addr, gameId: BigInt(gid), delegate: relayer, expiresAt: BigInt(expiresAt) }
-      const signature = await signer.signTypedData(domain, types, value)
-
-      // 4) Join WITH IDENTITY (new path)
       const gidAddress = getGamesIdAddressFromPrivyUser(user)
       const idToUse = gidAddress ? ethers.getAddress(gidAddress) : ethers.ZeroAddress
 
       toast(gidAddress ? 'Joining with your Monad Games ID…' : 'Joining…', 'loading')
-      let tx = await game.joinWithIdentity(gid, idToUse)
+      const tx = await game.joinWithSetup(gid, idToUse, { delegateExpiry: 0 })
       await tx.wait()
 
-      // 5) Set delegate approval (second tx)
-      try {
-        toast('Granting finalize approval…', 'loading')
-        tx = await game.setDelegateApproval(gid, { player: addr, delegate: relayer, expiresAt, signature })
-        await tx.wait()
-      } catch (e) {
-        console.warn('setDelegateApproval failed (continuing):', e)
-        toast('Joined. Could not set finalize approval (relayer may ask later).', 'warn')
-      }
-
+      toast('Joined!', 'success')
       onJoined?.({ code: codeUpper, gameId: String(gid) })
       localStorage.setItem('activeGame', JSON.stringify({ id: String(gid), code: codeUpper }))
       onClose?.()
     } catch (e) {
-      console.error('[join] error', e)
-      const msg = e?.shortMessage || e?.reason || e?.message || 'Join failed'
+      const msg = e?.shortMessage || e?.message || 'Join failed'
       toast(msg, 'error')
-    } finally {
-      setBusy(false)
-    }
+    } finally { setBusy(false) }
   }
 
   return (
-    <div className={['transition-all duration-300 overflow-hidden', open ? 'max-h-[600px] opacity-100 mt-4' : 'max-h-0 opacity-0'].join(' ')} aria-hidden={!open}>
-      <div className="rounded-xl border border-slate-800 bg-slate-900">
-        <div className="px-5 py-4 flex items-center justify-between border-b border-slate-800">
-          <div className="text-lg font-semibold">Join a Game</div>
-          <button onClick={onClose} className="px-2 py-1 rounded-md bg-slate-800 border border-slate-700">Close</button>
-        </div>
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 backdrop-blur">
+      <div className="w-[560px] max-w-[94vw] rounded-2xl p-[1px] bg-gradient-to-br from-indigo-500/40 via-fuchsia-500/40 to-cyan-500/40">
+        <div className="rounded-2xl bg-[#0b0e17]/95 border border-white/10 shadow-2xl">
+          <div className="p-6 border-b border-white/10">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-xl font-semibold tracking-tight">Join a game</h3>
+                <p className="text-xs text-white/60 mt-1">One tx: join + Games-ID + relayer approval</p>
+              </div>
+              <button onClick={onClose} className="text-white/60 hover:text-white text-sm">Close</button>
+            </div>
+          </div>
 
-        <div className="p-5 space-y-3">
-          <label className="block text-sm">Invite code</label>
-          <input
-            value={code}
-            onChange={e => setCode((e.target.value || '').toUpperCase())}
-            className="w-full px-3 py-2 rounded-md bg-slate-800 border border-slate-700"
-            placeholder="ABC123"
-          />
+          <div className="p-6 space-y-5">
+            <label className="flex flex-col gap-1">
+              <span className="text-sm text-white/70">Invite code</span>
+              <div className="flex items-center gap-2">
+                <input
+                  className="flex-1 px-3 py-2 rounded-lg bg-slate-900 border border-white/10 tracking-widest uppercase font-mono"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,''))}
+                  placeholder="ABC123"
+                  maxLength={6}
+                />
+                <button onClick={pasteCode} className="px-3 py-2 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10">
+                  Paste
+                </button>
+                <button onClick={() => setCode('')} className="px-3 py-2 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10">
+                  Clear
+                </button>
+              </div>
+            </label>
 
-          <label className="flex items-start gap-2 text-sm text-slate-300">
-            <input type="checkbox" className="mt-1" checked={terms} onChange={e => setTerms(e.target.checked)} />
-            <span>
-              By joining you accept fixed timing (~15 rounds), sudden death tie-breaks, auto-picks on timeouts,
-              and 0 points for missed submissions.
-            </span>
-          </label>
-        </div>
+            <label className="flex items-start gap-2">
+              <input type="checkbox" checked={terms} onChange={(e) => setTerms(e.target.checked)} />
+              <span className="text-sm text-white/70">
+                I accept that timeouts may auto-advance rounds (auto-pick rules).
+              </span>
+            </label>
+          </div>
 
-        <div className="p-5 border-t border-slate-800 flex justify-end gap-2">
-          <button className="px-3 py-1.5" onClick={onClose}>Cancel</button>
-          <button
-            onClick={doJoin}
-            disabled={disabled || busy}
-            className="px-3 py-1.5 rounded-md bg-indigo-600 disabled:opacity-50"
-          >
-            {busy ? 'Joining…' : 'Join'}
-          </button>
+          <div className="p-6 pt-3 border-t border-white/10 flex justify-end gap-2">
+            <button className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10" onClick={onClose}>Cancel</button>
+            <button
+              onClick={doJoin}
+              disabled={disabled || busy}
+              className="px-4 py-2 rounded-lg bg-gradient-to-r from-indigo-600 to-fuchsia-600 hover:from-indigo-500 hover:to-fuchsia-500 disabled:opacity-50">
+              {busy ? 'Joining…' : 'Join'}
+            </button>
+          </div>
         </div>
       </div>
     </div>
