@@ -1,141 +1,175 @@
 // src/components/modals/RecallModal.jsx
 import React from 'react'
-import { toast } from '../../lib/toast.jsx'
+import { ethers } from 'ethers'
+import { usePrivy } from '@privy-io/react-auth'
+import { useUsernamesMulti } from '../../hooks/useUsernamesMulti.js'
 
-const EXPLORER_TX = 'https://testnet.monadexplorer.com/tx/'
+const ABI_GAME = [
+  'event FinalScores(uint256 indexed gameId, address[] players, uint32[] scores, address[] winners)'
+]
 
 export default function RecallModal() {
-  const dlgRef = React.useRef(null)
+  const { user } = usePrivy()
+  const myAddr = React.useMemo(() => {
+    try { return ethers.getAddress(user?.wallet?.address || user?.address || '') } catch { return '' }
+  }, [user])
 
-  const [gid, setGid] = React.useState('')
+  const [rows, setRows] = React.useState([]) // { gameId, date, yourScore, yourRank, winners[], players[] }
   const [loading, setLoading] = React.useState(false)
-  const [data, setData] = React.useState(null)
-  const [error, setError] = React.useState('')
+  const [err, setErr] = React.useState('')
 
-  React.useEffect(() => {
-    const el = dlgRef.current
-    if (!el) return
-    const onCancel = (e) => { e.preventDefault(); el.close() } // ESC closes
-    el.addEventListener('cancel', onCancel)
-    return () => el.removeEventListener('cancel', onCancel)
-  }, [])
+  // for pretty names
+  const allAddrs = React.useMemo(() => {
+    const s = new Set()
+    rows.forEach(r => { (r.players||[]).forEach(a => s.add(a)); (r.winners||[]).forEach(a=>s.add(a)) })
+    return Array.from(s)
+  }, [rows])
+  const [names, setNames] = React.useState({})
+  useUsernamesMulti(allAddrs, setNames)
+  const display = (a) => names[a?.toLowerCase?.()] || short(a)
 
-  function close() {
-    dlgRef.current?.close()
-    // small delay to avoid flicker while closing
-    setTimeout(() => { setData(null); setError(''); setGid('') }, 150)
-  }
+  const rpcUrl  = import.meta.env.VITE_RPC_URL || 'https://testnet-rpc.monad.xyz/'
+  const gameAddr = import.meta.env.VITE_GAME_ADDRESS
+  const deployBlock = Number(import.meta.env.VITE_GAME_DEPLOY_BLOCK || 0)
 
-  // Helper: fetch with timeout
-  async function fetchWithTimeout(url, opts = {}, timeoutMs = 10000) {
-    const ctrl = new AbortController()
-    const t = setTimeout(() => ctrl.abort(), timeoutMs)
+  function short(a) { if (!a) return '—'; return `${a.slice(0,6)}…${a.slice(-4)}` }
+
+  async function loadMine() {
+    if (!myAddr) { setRows([]); return }
+    if (!gameAddr) throw new Error('GAME address missing')
+    setLoading(true); setErr('')
     try {
-      const r = await fetch(url, { ...opts, signal: ctrl.signal })
-      return r
-    } finally {
-      clearTimeout(t)
-    }
-  }
+      const provider = new ethers.JsonRpcProvider(rpcUrl)
+      const iface = new ethers.Interface(ABI_GAME)
+      const topic = iface.getEvent('FinalScores').topicHash
+      const latest = await provider.getBlockNumber()
+      const CHUNK = 8000
+      const from = Math.max(0, deployBlock || 0)
 
-  async function fetchStats() {
-    const n = Number(gid)
-    if (!n || n < 1) return toast('Enter a valid game ID', 'error')
-    setLoading(true); setError(''); setData(null)
-    try {
-      const r = await fetchWithTimeout(`/api/recall?gameId=${n}`, {}, 8000)
-      const j = await r.json()
-      if (!r.ok) {
-        setError(j?.error || 'Not found')
-        setData(null)
-      } else {
-        setData(j)
+      const mine = []
+      // cache block timestamps so we don't re-fetch
+      const tsCache = new Map()
+
+      for (let start = from; start <= latest; start += CHUNK + 1) {
+        const end = Math.min(latest, start + CHUNK)
+        const logs = await provider.getLogs({
+          address: gameAddr,
+          fromBlock: start,
+          toBlock: end,
+          topics: [topic]
+        })
+        for (const lg of logs) {
+          let parsed
+          try { parsed = iface.parseLog({ topics: lg.topics, data: lg.data }) } catch { continue }
+          const gid = Number(parsed.args?.gameId || 0n)
+          const players = (parsed.args?.players || []).map(a => ethers.getAddress(a))
+          if (!players.some(a => a.toLowerCase() === myAddr.toLowerCase())) continue
+
+          const scores  = Array.from(parsed.args?.scores || []).map(n => Number(n))
+          const winners = (parsed.args?.winners || []).map(a => ethers.getAddress(a))
+
+          const yourIdx = players.findIndex(a => a.toLowerCase() === myAddr.toLowerCase())
+          const yourScore = yourIdx >= 0 ? scores[yourIdx] : 0
+
+          // rank (1 = highest)
+          const sorted = [...scores].sort((a,b) => b - a)
+          const yourRank = sorted.findIndex(s => s === yourScore) + 1
+
+          // block time
+          let ts = tsCache.get(lg.blockNumber)
+          if (!ts) {
+            const blk = await provider.getBlock(lg.blockNumber)
+            ts = blk?.timestamp || 0
+            tsCache.set(lg.blockNumber, ts)
+          }
+
+          mine.push({
+            gameId: gid,
+            date: ts ? new Date(ts * 1000) : null,
+            yourScore,
+            yourRank,
+            winners,
+            players
+          })
+        }
       }
+
+      // newest first
+      mine.sort((a,b) => (b.date?.getTime() || 0) - (a.date?.getTime() || 0))
+      setRows(mine)
     } catch (e) {
-      setError(e?.message || 'Request failed')
+      setErr(e?.shortMessage || e?.message || 'Failed to load your history')
+      setRows([])
     } finally {
       setLoading(false)
     }
   }
 
-  const short = (a) => (a ? `${a.slice(0,6)}…${a.slice(-4)}` : '—')
-  const whenStr = data?.when ? new Date(data.when * 1000).toLocaleString() : null
+  React.useEffect(() => { loadMine()  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myAddr])
 
   return (
-    <dialog
-      id="recallModal"
-      ref={dlgRef}
-      className="rounded-xl p-0 bg-slate-900 text-slate-100 w-[42rem] max-w-[92vw] border border-slate-800"
-    >
-      <div className="px-5 py-4 flex items-center justify-between border-b border-slate-800">
-        <div className="text-lg font-semibold">Recall Game Stats</div>
-        <button onClick={close} className="px-2 py-1 rounded-md bg-slate-800 border border-slate-700">
+    <dialog id="recallModal" className="rounded-xl p-0 bg-slate-900 text-slate-100 w-[800px] max-w-[96vw]">
+      <div className="p-5 border-b border-slate-800 flex items-center justify-between">
+        <div>
+          <div className="text-lg font-semibold">Your game history</div>
+          <div className="text-xs text-white/60">All finished matches you participated in</div>
+        </div>
+        <button className="text-white/70 hover:text-white text-sm px-3 py-1.5 rounded-md bg-white/5 border border-white/10"
+                onClick={() => document.getElementById('recallModal')?.close()}>
           Close
         </button>
       </div>
 
-      <div className="p-5 space-y-4">
-        <div className="flex items-end gap-3">
-          <div className="flex-1">
-            <label className="block text-sm mb-1 text-slate-300">Game ID</label>
-            <input
-              value={gid}
-              onChange={e => setGid(e.target.value.replace(/[^\d]/g, ''))}
-              placeholder="e.g. 12"
-              className="w-full px-3 py-2 rounded-md bg-slate-800 border border-slate-700"
-            />
-          </div>
+      <div className="p-5">
+        <div className="mb-3 flex items-center gap-2">
           <button
-            disabled={loading || !gid}
-            onClick={fetchStats}
-            className="px-4 py-2 rounded-md bg-indigo-600 disabled:opacity-50"
+            className="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 hover:bg-slate-700"
+            onClick={loadMine} disabled={loading}
           >
-            {loading ? 'Loading…' : 'Recall'}
+            {loading ? 'Loading…' : 'Reload'}
           </button>
         </div>
 
-        {error && (
-          <div className="text-sm text-rose-300 bg-rose-950/40 border border-rose-900 rounded-md px-3 py-2">
-            {error}
+        {err ? (
+          <div className="text-rose-300 text-sm">{err}</div>
+        ) : loading ? (
+          <div className="text-slate-400 text-sm">Loading…</div>
+        ) : rows.length ? (
+          <div className="rounded-lg border border-slate-800 overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-800/60">
+                <tr>
+                  <th className="text-left px-3 py-2 font-medium text-white/80">When</th>
+                  <th className="text-left px-3 py-2 font-medium text-white/80">Game</th>
+                  <th className="text-right px-3 py-2 font-medium text-white/80">Your score</th>
+                  <th className="text-right px-3 py-2 font-medium text-white/80">Your rank</th>
+                  <th className="text-left px-3 py-2 font-medium text-white/80">Winners</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800">
+                {rows.map((r, i) => (
+                  <tr key={`${r.gameId}-${i}`}>
+                    <td className="px-3 py-2">{r.date ? r.date.toLocaleString() : '—'}</td>
+                    <td className="px-3 py-2">#{r.gameId}</td>
+                    <td className="px-3 py-2 text-right">{r.yourScore}</td>
+                    <td className="px-3 py-2 text-right">{r.yourRank || '—'}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex flex-wrap gap-2">
+                        {r.winners?.map((w) => (
+                          <span key={w} className="px-2 py-0.5 rounded bg-white/5 border border-white/10">
+                            {display(w)}
+                          </span>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        )}
-
-        {data && (
-          <div className="space-y-3">
-            <div className="text-sm text-slate-300">
-              <div>Game ID: <span className="text-slate-100 font-mono">{data.gameId}</span></div>
-              {whenStr && <div>When: <span className="text-slate-100">{whenStr}</span></div>}
-              {data.tx && (
-                <div>
-                  Tx: <a className="text-indigo-400 hover:underline" href={`${EXPLORER_TX}${data.tx}`} target="_blank" rel="noreferrer">{short(data.tx)}</a>
-                </div>
-              )}
-            </div>
-
-            {/* Example rendering; adapt to your API shape */}
-            {Array.isArray(data.players) && Array.isArray(data.scores) && (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm border border-slate-800 rounded-md overflow-hidden">
-                  <thead className="bg-slate-800/60">
-                    <tr>
-                      <th className="text-left px-3 py-2">#</th>
-                      <th className="text-left px-3 py-2">Player</th>
-                      <th className="text-right px-3 py-2">Score</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.players.map((p, i) => (
-                      <tr key={p} className="border-t border-slate-800">
-                        <td className="px-3 py-2">{i + 1}</td>
-                        <td className="px-3 py-2 font-mono">{short(p)}</td>
-                        <td className="px-3 py-2 text-right">{data.scores[i]}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
+        ) : (
+          <div className="text-slate-400 text-sm">No finished games found for your address.</div>
         )}
       </div>
     </dialog>
