@@ -1,13 +1,13 @@
-// api/finalize.js
+// api/finalize.js 
 // Ethers v6 + optional Upstash Redis for embedded -> identity mapping
 import { ethers } from 'ethers'
 import { Redis } from '@upstash/redis'
 import abi from '../src/abi/abiGame.js'
 
-const RPC_URL    = process.env.RPC_URL || process.env.MONAD_RPC_URL
-const GAME_ADDR  = process.env.GAME_ADDRESS || process.env.VITE_GAME_ADDR
-const RELAYER_PK = process.env.RELAYER_PK
-const API_KEY    = process.env.API_KEY || process.env.VERCEL_API_KEY
+const RPC_URL    = process.env.RPC_URL || process.env.MONAD_RPC_URL || process.env.ANVIL_RPC_URL
+const GAME_ADDR  = process.env.GAME_ADDRESS || process.env.NEXT_PUBLIC_GAME_ADDRESS || process.env.VITE_GAME_ADDR
+const RELAYER_PK = process.env.RELAYER_PK || process.env.PRIVATE_KEY
+const API_KEY    = process.env.API_KEY || process.env.VERCEL_API_KEY || process.env.FINALIZE_API_KEY
 
 // Toggle: push identity (Monad Games ID) addresses to Leaderboard instead of embedded
 const USE_IDENTITY_FOR_LB = process.env.USE_IDENTITY_FOR_LB === '1'
@@ -66,7 +66,13 @@ function makeRequestId(chainId, gameAddr, gameId, players, scores) {
 
 // --- Upstash helpers (for embedded -> identity mapping) ---
 function makeRedis() {
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) return Redis.fromEnv()
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REST_TOKEN) {
+    // Note: some setups expose different env names; keep the original from your code too:
+    return Redis.fromEnv()
+  }
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return Redis.fromEnv()
+  }
   if (process.env.REDIS_URL && process.env.REDIS_TOKEN) {
     const url = process.env.REDIS_URL.replace(/^rediss:\/\//, 'https://')
     return new Redis({ url, token: process.env.REDIS_TOKEN })
@@ -75,7 +81,6 @@ function makeRedis() {
 }
 
 async function mapPlayersToIdentity(redis, players) {
-  // mget in batch; keep array order aligned with players
   const keys = players.map((p) => MAP_NS + String(p).toLowerCase())
   const vals = await redis.mget(...keys)
   return players.map((p, i) => {
@@ -120,11 +125,11 @@ export default async function handler(req, res) {
   const game      = new ethers.Contract(GAME_ADDR, abi, wallet)
   const net       = await provider.getNetwork()
 
-  // --- ABI sanity (helps when ABI is stale)
-  for (const fn of ['finalizeByDelegate','externalPushScores','getPlayers','delegate','delegateExpiry','getGameStatus','finalizeNonce']) {
-    if (typeof game[fn] !== 'function') {
-      return bad(res, `ABI missing ${fn}. Update abiGame.js to match the deployed contract.`, 500)
-    }
+  // --- ABI presence (tolerant)
+  const hasFinalizeByDelegate = typeof game.finalizeByDelegate === 'function'
+  const hasExternalPush       = typeof game.externalPushScores === 'function'
+  if (!hasExternalPush) {
+    return bad(res, 'ABI missing externalPushScores. Update abiGame.js to match the deployed contract.', 500)
   }
 
   // --- Canonical players from chain (authoritative order)
@@ -145,57 +150,73 @@ export default async function handler(req, res) {
   const winners = computeWinners(players, scores)
   if (!winners.length) return bad(res, 'No winners computed')
 
-  // --- Preflight: check delegates for each player
-  const now = Math.floor(Date.now() / 1000)
-  const missing = []
-  for (const p of players) {
-    const del = await game.delegate(gameId, p).catch(() => ethers.ZeroAddress)
-    const exp = Number(await game.delegateExpiry(gameId, p).catch(() => 0n))
-    const ok  = (del.toLowerCase() === relayer.toLowerCase()) && (exp === 0 || exp >= now)
-    if (!ok) missing.push({ player: p, delegate: del, expiry: exp })
-  }
-  if (missing.length) {
-    return bad(res, 'Missing delegate approvals for some players', 400, { missingDelegates: missing, relayer })
-  }
+  // --- 0) Status snapshot
+  let statusCode = Number(await game.getGameStatus(gameId).catch(() => 0))
+  // 0=None, 1=Lobby, 2=Started, 3=Finished, 4=Cancelled
 
-  // --- Nonce for finalize
-  const nonce = await game.finalizeNonce(gameId).catch(() => 0n)
-
-  // --- 1) finalize on-chain state by delegate
+  // --- 1) finalize on-chain state by delegate IF supported
   let finalized = false
-  try {
-    const payload = {
-      gameId: BigInt(gameId),
-      players,
-      scores: scores.map((n) => BigInt(n)),
-      winners,
-      roundCount: BigInt(body.roundCount ?? 10),
-      nonce,
-      deadline: 0n,
-      roundsHash: ethers.ZeroHash,
+  if (hasFinalizeByDelegate) {
+    // Preflight: check delegates for each player (only needed if we’ll call finalizeByDelegate)
+    const now = Math.floor(Date.now() / 1000)
+    const missing = []
+    for (const p of players) {
+      const del = await game.delegate(gameId, p).catch(() => ethers.ZeroAddress)
+      const exp = Number(await game.delegateExpiry(gameId, p).catch(() => 0n))
+      const ok  = (String(del).toLowerCase() === String(relayer).toLowerCase()) && (exp === 0 || exp >= now)
+      if (!ok) missing.push({ player: p, delegate: del, expiry: exp })
     }
-    const tx = await game.finalizeByDelegate(payload)
-    await tx.wait()
-    finalized = true
-  } catch (e) {
-    // If already finished, keep going; otherwise surface reason
-    const st = Number(await game.getGameStatus(gameId).catch(() => 0))
-    if (st !== 3) { // 3 = Finished
-      return bad(res, 'finalizeByDelegate failed', 500, { reason: e.shortMessage || e.reason || e.message })
+    if (missing.length) {
+      return bad(res, 'Missing delegate approvals for some players', 400, { missingDelegates: missing, relayer })
+    }
+
+    // Nonce for finalize
+    const nonce = await game.finalizeNonce(gameId).catch(() => 0n)
+
+    try {
+      const payload = {
+        gameId: BigInt(gameId),
+        players,
+        scores: scores.map((n) => BigInt(n)),
+        winners,
+        roundCount: BigInt(body.roundCount ?? 10),
+        nonce,
+        deadline: 0n,
+        roundsHash: ethers.ZeroHash,
+      }
+      const tx = await game.finalizeByDelegate(payload)
+      await tx.wait()
+      finalized = true
+      statusCode = 3 // Finished
+    } catch (e) {
+      // If already finished, keep going; otherwise surface reason
+      statusCode = Number(await game.getGameStatus(gameId).catch(() => 0))
+      if (statusCode !== 3) {
+        return bad(res, 'finalizeByDelegate failed', 500, { reason: e.shortMessage || e.reason || e.message })
+      }
+    }
+  } else {
+    // No finalizeByDelegate in ABI: we can only proceed if already finished
+    if (statusCode !== 3) {
+      return bad(res, 'Game not finished and finalizeByDelegate is unavailable. Finalize via your multi-sig flow or add finalizeByDelegate.', 400, { statusCode })
     }
   }
 
-  // --- 2) external push to Leaderboard (role required on game)
-  // Optional early role check for clearer error (if exposed)
+  // --- 2) external push to Leaderboard (role or globalRelayer)
+  // (We no longer require SUBMITTER_ROLE strictly; contract also accepts current globalRelayer)
+  let pushAuth = 'unknown'
   const SUBMITTER_ROLE = ethers.keccak256(ethers.toUtf8Bytes('SUBMITTER_ROLE'))
   try {
     const hasRole = await game.hasRole?.(SUBMITTER_ROLE, relayer).catch(() => null)
-    if (hasRole === false) {
-      return bad(res, 'Relayer lacks SUBMITTER_ROLE on the game contract', 500, { relayer })
+    const glr = await game.globalRelayer?.().catch(() => ethers.ZeroAddress)
+    const isGlr = String(glr || '').toLowerCase() === String(relayer).toLowerCase()
+    pushAuth = hasRole ? 'SUBMITTER_ROLE' : (isGlr ? 'globalRelayer' : 'none')
+    if (pushAuth === 'none') {
+      // We'll try anyway; if contract rejects, the catch below returns a soft success with a warning.
     }
   } catch {}
 
-  // Map to identity addresses just for the LB push (if enabled)
+  // Map to identity addresses just for the LB preview (contract already maps internally via identityOf)
   let lbPlayers = players
   let mappedPairs = []
   if (USE_IDENTITY_FOR_LB) {
@@ -204,7 +225,7 @@ export default async function handler(req, res) {
       lbPlayers = await mapPlayersToIdentity(redis, players)
       mappedPairs = players.map((p, i) => ({ embedded: p, identity: lbPlayers[i] }))
     } catch {
-      lbPlayers = players // fallback to embedded if mapping infra fails
+      lbPlayers = players
     }
   }
 
@@ -215,7 +236,7 @@ export default async function handler(req, res) {
     await tx2.wait()
     pushed = true
   } catch (e) {
-    // Return soft success so UI can decide to retry; include mapping info for debugging
+    // Return soft success so UI can decide to retry; include mapping + auth info for debugging
     return res.status(200).json({
       ok: true,
       finalized,
@@ -223,7 +244,8 @@ export default async function handler(req, res) {
       usedIdentityForLB: USE_IDENTITY_FOR_LB,
       playersPushed: lbPlayers,
       mapPreview: mappedPairs.slice(0, players.length),
-      warning: e.shortMessage || e.reason || e.message || 'externalPushScores failed',
+      pushAuth,
+      warning: e.shortMessage || e.reason || e.message || 'externalPushScores failed (likely not authorized or consent missing)',
     })
   }
 
@@ -234,5 +256,6 @@ export default async function handler(req, res) {
     usedIdentityForLB: USE_IDENTITY_FOR_LB,
     playersPushed: lbPlayers,
     mapPreview: mappedPairs.slice(0, players.length),
+    pushAuth,
   })
-    }
+}
