@@ -48,7 +48,7 @@ export default function Header({
   return (
     <header className="sticky top-0 z-50 bg-slate-950/80 backdrop-blur border-b border-slate-800">
       <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
-        <h1 className="text-lg font-semibold">Monad CAH</h1>
+        <h1 className="text-lg font-semibold">Monad Against Humanity</h1>
 
         <div className="ml-auto flex items-center gap-2">
           {!connected ? (
@@ -172,6 +172,13 @@ export default function Header({
                       role="menuitem"
                     >
                       Cards
+                    </button>
+                    <button
+                      className="w-full text-left px-3 py-2 text-sm hover:bg-slate-800"
+                      onClick={() => openModal('leaderboardModal')}
+                      role="menuitem"
+                    >
+                      Leaderboard
                     </button>
                     <button
                       className="w-full text-left px-3 py-2 text-sm hover:bg-slate-800"
