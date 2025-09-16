@@ -17,6 +17,7 @@
     "react-router-dom": "^6.26.1",
     "viem": "^2.0.0",
     "buffer": "^6.0.3",
+    "@vercel/kv": "^1.0.0",
     "@upstash/redis": "latest"
   },
   "devDependencies": {
