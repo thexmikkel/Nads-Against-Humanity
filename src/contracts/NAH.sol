@@ -11,8 +11,12 @@ interface ILeaderboard {
     function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount) external;
 }
 
-contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
+contract MonadNAHv4 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
     using ECDSA for bytes32;
+
+    // New globals
+    address public globalRelayer;
+    event RelayerUpdated(address indexed oldRelayer, address indexed newRelayer);
 
     // ===== Roles =====
     bytes32 public constant DEV_ROLE       = keccak256("DEV_ROLE");
@@ -57,6 +61,9 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
     // Per-game identity mapping: embedded → Games-ID
     mapping(uint256 => mapping(address => address)) public identityOf;
 
+    // Per-game consent for the *current* globalRelayer
+    mapping(uint256 => mapping(address => bool)) public relayerConsent;
+
     // Lobby code → gameId
     mapping(bytes32 => uint256) public codeToGameId;
 
@@ -77,6 +84,10 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
     bytes32 public constant FINALIZATION_TYPEHASH = keccak256(
         "Finalization(uint256 gameId,address[] players,uint32[] scores,address[] winners,uint32 roundCount,uint256 nonce,uint256 deadline,bytes32 roundsHash)"
     );
+    bytes32 public constant DELEGATE_APPROVAL_TYPEHASH = keccak256(
+        "DelegateApproval(address player,address delegate,uint256 gameId,uint256 expiresAt)"
+    );
+
 
     // ===== Events =====
     event GameCreated(uint256 indexed gameId, bytes32 indexed inviteCodeHash, address indexed creator, bool usePrize, uint256 prizeAmount, uint256 gameFee);
@@ -205,6 +216,12 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
         emit GameFeeUpdated(old, newFee, block.timestamp);
     }
 
+    function setGlobalRelayer(address newRelayer) external onlyRole(DEV_ROLE) {
+        address old = globalRelayer;
+        globalRelayer = newRelayer;
+        emit RelayerUpdated(old, newRelayer);
+    }
+
     function setLimits(
         uint8 _minMaxPlayers,
         uint8 _maxMaxPlayers,
@@ -244,14 +261,6 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
     }
 
     // ===== Identity (Games-ID) =====
-    function setIdentityForThisGame(uint256 gameId, address gamesID) external {
-        require(gamesID != address(0), "gid=0");
-        address existing = identityOf[gameId][msg.sender];
-        require(existing == address(0) || existing == gamesID, "identity already set");
-        identityOf[gameId][msg.sender] = gamesID;
-        emit IdentityLinked(gameId, msg.sender, gamesID);
-    }
-
     function adminSetIdentity(uint256 gameId, address embedded, address gamesID)
         external onlyRole(DEV_ROLE)
     {
@@ -391,6 +400,71 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
         }
     }
 
+    function createGameWithSetup(
+        bytes32 inviteCodeHash,
+        uint8   maxPlayers,
+        uint32  lobbyExpirySeconds,
+        bool    usePrize,
+        uint256 prizeAmount,
+        address gamesID,
+        OneTxSetup calldata s
+    ) external payable whenNotPaused returns (uint256 gameId) {
+        gameId = createGame(inviteCodeHash, maxPlayers, lobbyExpirySeconds, usePrize, prizeAmount);
+
+        // Link Games-ID for creator (same semantics as your setIdentityForThisGame)
+        if (gamesID != address(0)) {
+            address existing = identityOf[gameId][msg.sender];
+            if (existing == address(0)) {
+                identityOf[gameId][msg.sender] = gamesID;
+                emit IdentityLinked(gameId, msg.sender, gamesID);
+            } else {
+                require(existing == gamesID, "identity already set");
+            }
+        }
+
+        // Consent + delegate to current global relayer (no signature needed; caller is player)
+        if (globalRelayer != address(0)) {
+            relayerConsent[gameId][msg.sender] = true;
+            delegate[gameId][msg.sender] = globalRelayer;
+            delegateExpiry[gameId][msg.sender] = s.delegateExpiry;
+            emit DelegateSet(gameId, msg.sender, globalRelayer, s.delegateExpiry);
+        }
+    }
+
+    function joinWithSetup(
+        uint256 gameId,
+        address gamesID,
+        OneTxSetup calldata s
+    ) external whenNotPaused {
+        Game storage g = games[gameId];
+        require(g.creator != address(0), "bad game");
+        require(!g.cancelled && !g.finished, "closed");
+        require(!g.started, "started");
+
+        if (!g.isPlayer[msg.sender]) {
+            _joinAs(gameId, msg.sender); // emits PlayerJoined
+        }
+
+        if (gamesID != address(0)) {
+            address existing = identityOf[gameId][msg.sender];
+            if (existing == address(0)) {
+                identityOf[gameId][msg.sender] = gamesID;
+                emit IdentityLinked(gameId, msg.sender, gamesID);
+            } else {
+                require(existing == gamesID, "identity already set");
+            }
+        }
+
+        if (globalRelayer != address(0)) {
+            relayerConsent[gameId][msg.sender] = true;
+            delegate[gameId][msg.sender] = globalRelayer;
+            delegateExpiry[gameId][msg.sender] = s.delegateExpiry;
+            emit DelegateSet(gameId, msg.sender, globalRelayer, s.delegateExpiry);
+        }
+
+        _maybeAutostart(g, gameId);
+    }
+
     function forceStart(uint256 gameId) external whenNotPaused {
         Game storage g = games[gameId];
         require(g.creator != address(0), "bad game");
@@ -482,6 +556,11 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
         uint256   deadline;
         bytes32   roundsHash;
     }
+
+    struct OneTxSetup {
+        uint64 delegateExpiry; // 0 = no expiry
+    }
+
     struct JoinTicket {
         address player;
         uint256 gameId;
@@ -598,6 +677,92 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
         emit GameEnded(p.gameId, GameStatus.Finished, uint64(block.timestamp));
     }
 
+/// Finalize by relayer/delegate (no player signatures).
+/// Requirements:
+/// - game started, not finished/cancelled
+/// - caller is SUBMITTER_ROLE or current globalRelayer
+/// - if caller is globalRelayer: every player must have relayerConsent[gid][player]==true,
+///   delegate[gid][player]==globalRelayer, and delegateExpiry not expired
+function finalizeByDelegate(FinalizePayload calldata p)
+    external
+    whenNotPaused
+    nonReentrant
+{
+    Game storage g = games[p.gameId];
+    require(g.creator != address(0), "bad game");
+    require(g.started && !g.finished && !g.cancelled, "not active");
+
+    uint256 n = p.players.length;
+    require(n == p.scores.length && n == g.players.length, "LEN_MISMATCH");
+    require(p.winners.length >= 1, "no winners");
+    require(p.deadline == 0 || block.timestamp <= p.deadline, "expired payload");
+    require(p.nonce == finalizeNonce[p.gameId], "bad nonce");
+
+    // players must exactly match lobby order (avoids misalignment)
+    for (uint256 i = 0; i < n; i++) {
+        require(g.players[i] == p.players[i], "players order");
+        require(g.isPlayer[p.players[i]], "unknown player");
+    }
+    // winners must be players
+    for (uint256 w = 0; w < p.winners.length; w++) {
+        require(g.isPlayer[p.winners[w]], "winner !player");
+    }
+
+    // Authorization
+    bool isSubmitter = hasRole(SUBMITTER_ROLE, msg.sender);
+    bool isRelayer   = (msg.sender == globalRelayer) && (globalRelayer != address(0));
+    require(isSubmitter || isRelayer, "not authorized");
+
+    // If caller is the globalRelayer, enforce per-player consent + valid delegate
+    if (isRelayer) {
+        for (uint256 i = 0; i < n; i++) {
+            address pl = p.players[i];
+            require(relayerConsent[p.gameId][pl], "no consent");
+            require(delegate[p.gameId][pl] == globalRelayer, "bad delegate");
+            uint64 exp = delegateExpiry[p.gameId][pl];
+            require(exp == 0 || block.timestamp <= exp, "delegate expired");
+        }
+    }
+
+    // ---- settle (same as finalizeGame) ----
+    g.finished = true;
+    finalizeNonce[p.gameId] += 1;
+    if (codeToGameId[g.inviteCodeHash] == p.gameId) {
+        delete codeToGameId[g.inviteCodeHash];
+    }
+
+    for (uint256 i = 0; i < n; i++) {
+        address pl = p.players[i];
+        totals[pl].score       += uint64(p.scores[i]);
+        totals[pl].gamesPlayed += 1;
+        if (activeGameOf[pl] == p.gameId) activeGameOf[pl] = 0;
+    }
+
+    if (g.usePrize && g.prizeAmount > 0) {
+        reservedPrize -= g.prizeAmount;
+        uint256 each = g.prizeAmount / p.winners.length;
+        uint256 rem  = g.prizeAmount - (each * p.winners.length);
+        for (uint256 i = 0; i < p.winners.length; i++) {
+            uint256 amt = each + (i == 0 ? rem : 0);
+            (bool ok, ) = payable(p.winners[i]).call{value: amt}("");
+            require(ok, "prize pay failed");
+            emit PrizePaid(p.gameId, p.winners[i], amt);
+        }
+    }
+
+    // record for leaderboard push
+    finalPlayersCount[p.gameId] = uint16(n);
+    for (uint256 i = 0; i < n; i++) {
+        address pl = p.players[i];
+        finalRecorded[p.gameId][pl] = true;
+        finalScore[p.gameId][pl]    = p.scores[i];
+    }
+    finalHash[p.gameId] = keccak256(abi.encode(p.players, p.scores));
+
+    emit FinalScores(p.gameId, p.players, p.scores, p.winners);
+    emit GameEnded(p.gameId, GameStatus.Finished, uint64(block.timestamp));
+}
+
     // ===== Delegate (unchanged API; auto-start wired) =====
     struct DelegateApproval {
         address player;
@@ -613,20 +778,28 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
         return (delegate[gameId][player], delegateExpiry[gameId][player]);
     }
 
-    function setDelegateApproval(uint256 gameId, DelegateApproval calldata a) external whenNotPaused {
-        require(a.player == msg.sender || hasRole(DEV_ROLE, msg.sender), "not player");
-        delegate[gameId][a.player] = a.delegate;
-        delegateExpiry[gameId][a.player] = uint64(a.expiresAt);
-        emit DelegateSet(gameId, a.player, a.delegate, uint64(a.expiresAt));
-    }
-
     function joinGameWithApproval(uint256 gameId, DelegateApproval calldata a) external whenNotPaused {
         require(a.delegate == msg.sender, "not delegate");
         require(a.expiresAt == 0 || block.timestamp <= a.expiresAt, "approval expired");
+
+        // EIP-712 verify: player must have signed this approval for this game
+        bytes32 dDigest = _hashTypedDataV4(
+            keccak256(abi.encode(
+                DELEGATE_APPROVAL_TYPEHASH,
+                a.player,
+                a.delegate,
+                gameId,
+                a.expiresAt
+            ))
+        );
+        address signer = ECDSA.recover(dDigest, a.signature);
+        require(signer == a.player, "bad delegate sig");
+
         delegate[gameId][a.player] = a.delegate;
         delegateExpiry[gameId][a.player] = uint64(a.expiresAt);
         _joinAs(gameId, a.player);
         emit DelegateSet(gameId, a.player, a.delegate, uint64(a.expiresAt));
+
         Game storage g = games[gameId];
         _maybeAutostart(g, gameId);
     }
@@ -634,12 +807,28 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
     function joinGameByCodeWithApproval(bytes32 inviteCodeHash, DelegateApproval calldata a) external whenNotPaused {
         require(a.delegate == msg.sender, "not delegate");
         require(a.expiresAt == 0 || block.timestamp <= a.expiresAt, "approval expired");
+
         uint256 gameId = codeToGameId[inviteCodeHash];
         require(gameId != 0, "unknown code");
+
+        // EIP-712 verify: player must have signed this approval for this game
+        bytes32 dDigest = _hashTypedDataV4(
+            keccak256(abi.encode(
+                DELEGATE_APPROVAL_TYPEHASH,
+                a.player,
+                a.delegate,
+                gameId,
+                a.expiresAt
+            ))
+        );
+        address signer = ECDSA.recover(dDigest, a.signature);
+        require(signer == a.player, "bad delegate sig");
+
         delegate[gameId][a.player] = a.delegate;
         delegateExpiry[gameId][a.player] = uint64(a.expiresAt);
         _joinAs(gameId, a.player);
         emit DelegateSet(gameId, a.player, a.delegate, uint64(a.expiresAt));
+
         Game storage g = games[gameId];
         _maybeAutostart(g, gameId);
     }
@@ -669,22 +858,37 @@ contract MonadCahV3 is AccessControl, Pausable, ReentrancyGuard, EIP712 {
         address[] calldata players,
         uint32[]  calldata scores,
         bytes32   requestId
-    ) external onlyRole(SUBMITTER_ROLE) {
+    ) external {
+        // Must be globally enabled and have a leaderboard target
         require(leaderboardEnabled && leaderboard != address(0), "LB disabled");
-        require(players.length == scores.length && players.length > 0, "LEN");
-        require(!seenExternalPush[requestId], "duplicate");
-        seenExternalPush[requestId] = true;
 
         Game storage g = games[gameId];
         require(g.creator != address(0), "bad game");
         require(g.finished && !g.cancelled, "not finished");
 
+        // Auth: either global SUBMITTER_ROLE or the current global relayer
+        bool isAuthorized =
+            hasRole(SUBMITTER_ROLE, msg.sender) ||
+            (msg.sender == globalRelayer && globalRelayer != address(0));
+        require(isAuthorized, "not authorized to push");
+
+        require(players.length == scores.length && players.length > 0, "LEN");
+        require(!seenExternalPush[requestId], "duplicate");
+        seenExternalPush[requestId] = true;
+
         for (uint256 i = 0; i < players.length; i++) {
             address p = players[i];
             require(finalRecorded[gameId][p], "not in final");
             if (pushedScore[gameId][p]) continue;
+
+            // If caller is relayer, per-player consent must be present
+            if (msg.sender == globalRelayer) {
+                require(relayerConsent[gameId][p], "player no consent");
+            }
+
             uint32 s = scores[i];
 
+            // Resolve identity for leaderboard (Games-ID if present)
             address who = identityOf[gameId][p];
             if (who == address(0)) who = p;
 
