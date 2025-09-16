@@ -84,6 +84,44 @@ export function buildFinalizationMessage({
   }
 }
 
+// --- Public Lobby: Publish / Unpublish -----------------------------
+
+// PublishLobby(signer,address gameId,uint256 inviteCodeHash, uint256 deadline)
+export const PublishLobbyTypes = {
+  PublishLobby: [
+    { name: 'signer', type: 'address' },
+    { name: 'gameId', type: 'uint256' },
+    { name: 'inviteCodeHash', type: 'bytes32' },
+    { name: 'deadline', type: 'uint256' },
+  ]
+}
+
+export function buildPublishLobbyMessage({ signer, gameId, inviteCodeHash, deadline = 0 }) {
+  return {
+    signer,
+    gameId: BigInt(gameId),
+    inviteCodeHash,
+    deadline: BigInt(deadline || 0),
+  }
+}
+
+// UnpublishLobby(signer,address gameId,uint256 deadline)
+export const UnpublishLobbyTypes = {
+  UnpublishLobby: [
+    { name: 'signer', type: 'address' },
+    { name: 'gameId', type: 'uint256' },
+    { name: 'deadline', type: 'uint256' },
+  ]
+}
+
+export function buildUnpublishLobbyMessage({ signer, gameId, deadline = 0 }) {
+  return {
+    signer,
+    gameId: BigInt(gameId),
+    deadline: BigInt(deadline || 0),
+  }
+}
+
 export async function signTyped(signer, domain, types, message) {
   // ethers v6
   return await signer.signTypedData(domain, types, message)
